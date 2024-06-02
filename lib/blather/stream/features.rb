@@ -16,36 +16,41 @@ class Stream
       @stream, @succeed, @fail = stream, succeed, fail
     end
 
+    # Fetures may appear in the XML in any order, but sometimes
+    # we might prefer to try some first if present
+    FEATURE_SCORES = {
+      "urn:ieft:params:xml:ns:xmpp-tls" => 0,
+      "urn:ieft:params:xml:ns:xmpp-bind" => 1,
+      "urn:ieft:params:xml:ns:xmpp-session" => 1,
+      "urn:ietf:params:xml:ns:xmpp-sasl" => 2
+    }.freeze
+
     def receive_data(stanza)
       if @feature
         @feature.receive_data stanza
       else
         @features ||= stanza
+        @use_next =
+          @features.children
+            .map { |el| el.namespaces['xmlns'] }.compact
+            .sort { |x, y| FEATURE_SCORES.fetch(x, FEATURE_SCORES.length) <=> FEATURE_SCORES.fetch(y, FEATURE_SCORES.length) }
         next!
       end
     end
 
     def next!
-      if starttls = @features.at_xpath("tls:starttls",{"tls" => "urn:ietf:params:xml:ns:xmpp-tls"})
-        @feature = TLS.new(@stream, nil, @fail)
-        @feature.receive_data(starttls)
-        return
-      end
-
       bind = @features.at_xpath('ns:bind', ns: 'urn:ietf:params:xml:ns:xmpp-bind')
       session = @features.at_xpath('ns:session', ns: 'urn:ietf:params:xml:ns:xmpp-session')
       if bind && session && @features.children.last != session
         bind.after session
       end
 
-      @idx = @idx ? @idx+1 : 0
-      if stanza = @features.children[@idx]
+      if !@use_next.empty? && (stanza = @features.at_xpath('ns:*', ns: @use_next.shift))
         if stanza.namespaces['xmlns'] && (klass = self.class.from_namespace(stanza.namespaces['xmlns']))
           @feature = klass.new(
             @stream,
             proc {
               if (klass == Blather::Stream::Register && stanza = feature?(:mechanisms))
-                @idx = @features.children.index(stanza)
                 @feature = Blather::Stream::SASL.new @stream, proc { next! }, @fail
                 @feature.receive_data stanza
               else
